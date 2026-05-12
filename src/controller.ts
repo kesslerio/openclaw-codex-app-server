@@ -2392,25 +2392,19 @@ export class CodexPluginController {
     if (!liveProfile || pendingProfile || liveProfile === storedProfile) {
       return { binding };
     }
-    if (storedProfile === "default" && liveProfile === "full-access") {
-      const nextBinding = await this.persistBindingPermissionsMode(binding, liveProfile);
-      const conversation: ConversationTarget = {
-        channel: binding.conversation.channel,
-        accountId: binding.conversation.accountId,
-        conversationId: binding.conversation.conversationId,
-        parentConversationId: binding.conversation.parentConversationId,
-      };
-      this.api.logger.warn(
-        `codex refreshed binding permissions mode from live thread state ${this.formatConversationForLog(conversation)} stored=${storedProfile} live=${liveProfile} context=${context}`,
-      );
-      return {
-        binding: nextBinding,
-        note: "Permissions note: refreshed the stored mode from the live Full Access thread state.",
-      };
-    }
+    const nextBinding = await this.persistBindingPermissionsMode(binding, liveProfile);
+    const conversation: ConversationTarget = {
+      channel: binding.conversation.channel,
+      accountId: binding.conversation.accountId,
+      conversationId: binding.conversation.conversationId,
+      parentConversationId: binding.conversation.parentConversationId,
+    };
+    this.api.logger.warn(
+      `codex refreshed binding permissions mode from live thread state ${this.formatConversationForLog(conversation)} stored=${storedProfile} live=${liveProfile} context=${context}`,
+    );
     return {
-      binding,
-      note: `Permissions note: stored mode is ${formatPermissionsModeLabel(storedProfile)}, but the live thread reports ${formatPermissionsModeLabel(liveProfile)}.`,
+      binding: nextBinding,
+      note: `Permissions note: refreshed the stored mode from the live ${formatPermissionsModeLabel(liveProfile)} thread state.`,
     };
   }
 
@@ -6354,9 +6348,10 @@ export class CodexPluginController {
           threadId: binding.threadId,
         }),
       );
+    const liveProfile = inferPermissionsModeFromThreadState(state) ?? profile;
     const nextBinding: StoredBinding = {
       ...binding,
-      permissionsMode: profile,
+      permissionsMode: liveProfile,
       pendingPermissionsMode: undefined,
       workspaceDir: state.cwd?.trim() || binding.workspaceDir,
       threadTitle: state.threadName?.trim() || binding.threadTitle,
