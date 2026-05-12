@@ -42,7 +42,7 @@ const TEXT_ATTACHMENT_MIME_TYPES = new Set([
 ]);
 const MAX_TEXT_ATTACHMENT_BYTES = 64 * 1024;
 const MAX_TEXT_ATTACHMENT_CHARS = 16_000;
-const PLUGIN_VERSION = (() => {
+function readPackageVersion() {
     try {
         const packageJson = require("../package.json");
         return typeof packageJson.version === "string" && packageJson.version.trim()
@@ -50,9 +50,18 @@ const PLUGIN_VERSION = (() => {
             : "unknown";
     }
     catch {
-        return "unknown";
+        try {
+            const packageJson = require("../../package.json");
+            return typeof packageJson.version === "string" && packageJson.version.trim()
+                ? packageJson.version.trim()
+                : "unknown";
+        }
+        catch {
+            return "unknown";
+        }
     }
-})();
+}
+const PLUGIN_VERSION = readPackageVersion();
 function getSkillsPickerPageSize(channel) {
     return channel === "discord" ? 6 : 8;
 }
@@ -124,6 +133,20 @@ function normalizeTelegramChatId(raw) {
         return trimmed.slice("telegram:".length);
     }
     return trimmed;
+}
+function normalizeNumericThreadId(raw) {
+    if (typeof raw === "number") {
+        return Number.isFinite(raw) ? raw : undefined;
+    }
+    if (typeof raw !== "string") {
+        return undefined;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+    const value = Number(trimmed);
+    return Number.isFinite(value) ? value : undefined;
 }
 function normalizeDiscordConversationId(raw) {
     if (!raw) {
@@ -248,15 +271,18 @@ function resolveDiscordCommandConversation(ctx) {
 function toConversationTargetFromCommand(ctx) {
     if (isTelegramChannel(ctx.channel)) {
         const chatId = normalizeTelegramChatId(ctx.to ?? ctx.from ?? ctx.senderId);
+        const rawContext = ctx;
+        const threadId = normalizeNumericThreadId(ctx.messageThreadId) ??
+            normalizeNumericThreadId(rawContext.threadId);
         if (!chatId) {
             return null;
         }
         return {
             channel: "telegram",
             accountId: ctx.accountId ?? "default",
-            conversationId: typeof ctx.messageThreadId === "number" ? `${chatId}:topic:${ctx.messageThreadId}` : chatId,
-            parentConversationId: typeof ctx.messageThreadId === "number" ? chatId : undefined,
-            threadId: typeof ctx.messageThreadId === "number" ? ctx.messageThreadId : undefined,
+            conversationId: threadId != null ? `${chatId}:topic:${threadId}` : chatId,
+            parentConversationId: threadId != null ? chatId : undefined,
+            threadId,
         };
     }
     if (isDiscordChannel(ctx.channel)) {

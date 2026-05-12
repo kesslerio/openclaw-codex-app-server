@@ -2269,6 +2269,41 @@ describe("Discord controller flows", () => {
     })).toBeNull();
   });
 
+  it("uses string Telegram topic ids for cas_status binding lookups", async () => {
+    const { controller, sendMessageTelegram } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      threadTitle: "Topic Thread",
+      updatedAt: Date.now(),
+    });
+
+    const reply = await controller.handleCommand(
+      "cas_status",
+      buildTelegramCommandContext({
+        commandBody: "/cas_status",
+        messageThreadId: "456",
+        getCurrentConversationBinding: vi.fn(async () => null),
+      }),
+    );
+
+    expect(reply).toEqual({});
+    const lastCall = sendMessageTelegram.mock.calls.at(-1) as unknown as
+      | [string, string, { messageThreadId?: number }]
+      | undefined;
+    expect(lastCall?.[0]).toBe("123");
+    expect(lastCall?.[1]).toContain("Binding: Discord Thread (openclaw)");
+    expect(lastCall?.[1]).toContain("Project folder: /repo/openclaw");
+    expect(lastCall?.[2]?.messageThreadId).toBe(456);
+  });
+
   it("shows plan mode on in cas_status when the bound conversation has an active plan run", async () => {
     const { controller, sendComponentMessage } = await createControllerHarness();
     await (controller as any).store.upsertBinding({
