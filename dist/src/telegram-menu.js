@@ -1,6 +1,8 @@
 const TELEGRAM_COMMAND_LIMIT = 100;
 const TELEGRAM_DESCRIPTION_LIMIT = 256;
 const TELEGRAM_MENU_REPAIR_DELAY_MS = 10_000;
+const TELEGRAM_MENU_REPAIR_ATTEMPTS = 6;
+const TELEGRAM_MENU_REPAIR_RETRY_MS = 10_000;
 function normalizeTelegramCommandName(command) {
     return command.trim().replace(/-/g, "_").toLowerCase();
 }
@@ -67,12 +69,42 @@ export function scheduleTelegramMenuRepair(params) {
     if (!resolveTelegramBotToken(params.env ?? process.env)) {
         return undefined;
     }
-    const timer = setTimeout(() => {
-        repairTelegramMenuCommands(params).catch((error) => {
-            params.logger?.warn?.(`codex telegram menu repair failed: ${String(error)}`);
+    let attempts = 0;
+    let timer;
+    let cancelled = false;
+    const scheduleNext = (delayMs) => {
+        if (cancelled) {
+            return;
+        }
+        timer = setTimeout(runRepair, delayMs);
+        timer.unref?.();
+    };
+    const runRepair = () => {
+        if (cancelled) {
+            return;
+        }
+        attempts += 1;
+        repairTelegramMenuCommands(params)
+            .then(() => {
+            params.logger?.info?.(`codex telegram menu repair completed attempt=${attempts} commands=${params.commands.length}`);
+        })
+            .catch((error) => {
+            params.logger?.warn?.(`codex telegram menu repair failed attempt=${attempts}: ${String(error)}`);
+            if (cancelled || attempts >= TELEGRAM_MENU_REPAIR_ATTEMPTS) {
+                return;
+            }
+            scheduleNext(TELEGRAM_MENU_REPAIR_RETRY_MS);
         });
-    }, TELEGRAM_MENU_REPAIR_DELAY_MS);
-    timer.unref?.();
-    return timer;
+    };
+    scheduleNext(TELEGRAM_MENU_REPAIR_DELAY_MS);
+    return {
+        cancel: () => {
+            cancelled = true;
+            if (timer) {
+                clearTimeout(timer);
+                timer = undefined;
+            }
+        },
+    };
 }
 //# sourceMappingURL=telegram-menu.js.map

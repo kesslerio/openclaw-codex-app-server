@@ -2,6 +2,9 @@
   "id": "openclaw-codex-app-server",
   "name": "OpenClaw Plugin For Codex App Server",
   "description": "Independent OpenClaw plugin for the Codex App Server protocol with bound Telegram and Discord conversations.",
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

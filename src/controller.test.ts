@@ -1062,6 +1062,132 @@ describe("Discord controller flows", () => {
     });
   });
 
+  it("binds /cas_init --cwd to a new thread before forwarding init", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
+    const runHandle = {
+      result: new Promise(() => {}),
+      getThreadId: vi.fn(() => "thread-new"),
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: vi.fn(() => false),
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    };
+    clientMock.startThread.mockResolvedValueOnce({
+      threadId: "thread-new",
+      threadName: "New Thread",
+      model: "openai/gpt-5.4",
+      cwd: "/repo/lobster-workflows",
+      serviceTier: "default",
+    });
+    (clientMock as any).startTurn = vi.fn(() => runHandle);
+
+    const reply = await controller.handleCommand(
+      "cas_init",
+      buildTelegramCommandContext({
+        args: "--cwd /repo/lobster-workflows --help",
+        commandBody: "/cas_init --cwd /repo/lobster-workflows --help",
+        requestConversationBinding,
+      }),
+    );
+
+    expect(reply).toEqual({ text: "Sent /init to Codex." });
+    expect(clientMock.startThread).toHaveBeenCalledWith({
+      profile: "default",
+      sessionKey: undefined,
+      workspaceDir: "/repo/lobster-workflows",
+      model: undefined,
+    });
+    expect(requestConversationBinding).toHaveBeenCalled();
+    expect((clientMock as any).startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceDir: "/repo/lobster-workflows",
+        existingThreadId: "thread-new",
+        prompt: "/init --help",
+      }),
+    );
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(binding?.threadId).toBe("thread-new");
+    expect(binding?.workspaceDir).toBe("/repo/lobster-workflows");
+  });
+
+  it("forwards /cas_init --cwd after pending bind approval", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    const requestConversationBinding = vi.fn(async () => ({
+      status: "pending" as const,
+      reply: { text: "Plugin bind approval required" },
+    }));
+    const runHandle = {
+      result: Promise.resolve({ threadId: "thread-new", text: "initialized" }),
+      getThreadId: vi.fn(() => "thread-new"),
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: vi.fn(() => false),
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    };
+    clientMock.startThread.mockResolvedValueOnce({
+      threadId: "thread-new",
+      threadName: "New Thread",
+      model: "openai/gpt-5.4",
+      cwd: "/repo/lobster-workflows",
+      serviceTier: "default",
+    });
+    (clientMock as any).startTurn = vi.fn(() => runHandle);
+
+    const reply = await controller.handleCommand(
+      "cas_init",
+      buildTelegramCommandContext({
+        args: "--cwd /repo/lobster-workflows --help",
+        commandBody: "/cas_init --cwd /repo/lobster-workflows --help",
+        messageThreadId: 456,
+        requestConversationBinding,
+      }),
+    );
+
+    expect(reply).toEqual({ text: "Plugin bind approval required" });
+    expect((clientMock as any).startTurn).not.toHaveBeenCalled();
+
+    await controller.handleConversationBindingResolved({
+      status: "approved",
+      binding: {
+        bindingId: "binding-1",
+        pluginId: "openclaw-codex-app-server",
+        pluginRoot: "/plugins/codex",
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+        threadId: 456,
+        boundAt: Date.now(),
+      },
+      decision: "allow-once",
+      request: {
+        summary: "Bind this conversation to Codex thread New Thread.",
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: "123:topic:456",
+          parentConversationId: "123",
+          threadId: 456,
+        },
+      },
+    } as any);
+
+    expect((clientMock as any).startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceDir: "/repo/lobster-workflows",
+        existingThreadId: "thread-new",
+        prompt: "/init --help",
+      }),
+    );
+  });
+
   it("rejects resume when the thread worktree path no longer exists on disk", async () => {
     const { controller, clientMock } = await createControllerHarness();
     const missingWorktreePath = "/tmp/worktrees/bold-bartik/repo-name";
@@ -4100,6 +4226,93 @@ describe("Discord controller flows", () => {
 
     expect(result).toEqual({ handled: true });
     expect(startTurn).toHaveBeenCalled();
+  });
+
+  it("claims inbound Telegram topic messages after a topic command bind", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "hello",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "Who are you?",
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+      parentConversationId: "123",
+      threadId: "456",
+      isGroup: true,
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceDir: "/repo/openclaw",
+        existingThreadId: "thread-1",
+        prompt: "Who are you?",
+      }),
+    );
+  });
+
+  it("does not double-append Telegram topic ids for already-scoped inbound conversations", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "hello",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "Still Codex?",
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+      threadId: 456,
+      isGroup: true,
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        existingThreadId: "thread-1",
+        prompt: "Still Codex?",
+      }),
+    );
   });
 
   it("matches a Discord binding even when the inbound event includes a parent conversation id", async () => {

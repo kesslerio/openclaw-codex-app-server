@@ -152,8 +152,8 @@ Pre-release packages are published on matching npm dist-tags instead of `latest`
 | `/cas_model` | List models and show model-selection buttons when the conversation is bound. | Without a binding, it lists models only. |
 | `/cas_model gpt-5.4` | Set the model for the bound thread. | Also updates the saved preferred model for later turns. |
 | `/cas_permissions` | Show account, rate-limit, and current permission status. | To change permissions, use `/cas_status --yolo` or the status card. |
-| `/cas_init ...` | Forward `/init` to Codex. | Sends the alias straight through to the App Server. |
-| `/cas_diff ...` | Forward `/diff` to Codex. | Sends the alias straight through to the App Server. |
+| `/cas_init [--cwd <path>] ...` | Forward `/init` to Codex. | With `--cwd`, starts and binds a new thread in that workspace before forwarding `/init`. |
+| `/cas_diff [--cwd <path>] ...` | Forward `/diff` to Codex. | With `--cwd`, starts and binds a new thread in that workspace before forwarding `/diff`. |
 | `/cas_rename <new name>` | Rename the bound Codex thread. | Example: `/cas_rename approval flow cleanup` |
 | `/cas_rename --sync <new name>` | Rename the thread and try to sync the conversation/topic name too. | Requires an existing binding. |
 | `/cas_rename --sync` | Show suggested naming styles and sync the chosen one to the conversation too. | Useful when you want the derived thread/project naming without typing it out. |

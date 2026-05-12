@@ -575,8 +575,25 @@ function toConversationTargetFromInbound(event: {
   }
   const channel = event.channel.trim().toLowerCase();
   const conversationIdRaw = event.conversationId?.trim();
+  const numericThreadId =
+    typeof event.threadId === "number"
+      ? event.threadId
+      : typeof event.threadId === "string" && Number.isFinite(Number(event.threadId.trim()))
+        ? Number(event.threadId.trim())
+        : undefined;
   const conversationId =
-    channel === "discord"
+    channel === "telegram"
+      ? (() => {
+          const chatId = normalizeTelegramChatId(conversationIdRaw);
+          if (!chatId) {
+            return undefined;
+          }
+          if (chatId.includes(":topic:")) {
+            return chatId;
+          }
+          return numericThreadId != null ? `${chatId}:topic:${numericThreadId}` : chatId;
+        })()
+      : channel === "discord"
       ? (() => {
           const normalized = normalizeDiscordConversationId(conversationIdRaw);
           if (!normalized) {
@@ -592,7 +609,9 @@ function toConversationTargetFromInbound(event: {
         })()
       : event.conversationId;
   const parentConversationId =
-    channel === "discord"
+    channel === "telegram" && numericThreadId != null
+      ? normalizeTelegramChatId(event.parentConversationId) ?? normalizeTelegramChatId(conversationIdRaw)
+      : channel === "discord"
       ? normalizeDiscordConversationId(event.parentConversationId)
       : event.parentConversationId;
   if (!conversationId) {
@@ -606,13 +625,7 @@ function toConversationTargetFromInbound(event: {
     threadId:
       channel === "discord"
         ? undefined
-        : typeof event.threadId === "number"
-          ? event.threadId
-          : typeof event.threadId === "string"
-            ? Number.isFinite(Number(event.threadId))
-              ? Number(event.threadId)
-              : undefined
-            : undefined,
+        : numericThreadId,
   };
 }
 
@@ -1389,7 +1402,7 @@ export class CodexPluginController {
   private readonly store;
   private serviceWorkspaceDir?: string;
   private lastRuntimeConfig?: unknown;
-  private telegramMenuRepairTimer?: NodeJS.Timeout;
+  private telegramMenuRepairHandle?: ReturnType<typeof scheduleTelegramMenuRepair>;
   private started = false;
 
   constructor(private readonly api: OpenClawPluginApi) {
@@ -1417,7 +1430,7 @@ export class CodexPluginController {
     }
     await this.store.load();
     await this.client.logStartupProbe().catch(() => undefined);
-    this.telegramMenuRepairTimer = scheduleTelegramMenuRepair({
+    this.telegramMenuRepairHandle = scheduleTelegramMenuRepair({
       commands: COMMANDS,
       logger: this.api.logger,
     });
@@ -1431,9 +1444,9 @@ export class CodexPluginController {
     for (const active of this.activeRuns.values()) {
       await active.handle.interrupt().catch(() => undefined);
     }
-    if (this.telegramMenuRepairTimer) {
-      clearTimeout(this.telegramMenuRepairTimer);
-      this.telegramMenuRepairTimer = undefined;
+    if (this.telegramMenuRepairHandle) {
+      this.telegramMenuRepairHandle.cancel();
+      this.telegramMenuRepairHandle = undefined;
     }
     this.activeRuns.clear();
     await this.client.close().catch(() => undefined);
@@ -1471,7 +1484,7 @@ export class CodexPluginController {
       await this.store.removePendingBind(conversation);
       return;
     }
-    await this.bindConversation(conversation, {
+    const binding = await this.bindConversation(conversation, {
       threadId: pending.threadId,
       workspaceDir: pending.workspaceDir,
       threadTitle: pending.threadTitle,
@@ -1491,6 +1504,15 @@ export class CodexPluginController {
     }
     if (pending.notifyBound) {
       await this.sendBoundConversationNotifications(conversation);
+    }
+    if (pending.followUpPrompt?.trim()) {
+      await this.startTurn({
+        conversation,
+        binding,
+        workspaceDir: binding.workspaceDir,
+        prompt: pending.followUpPrompt.trim(),
+        reason: "command",
+      });
     }
   }
 
@@ -1982,9 +2004,9 @@ export class CodexPluginController {
           Boolean(currentBinding || binding),
         );
       case "cas_init":
-        return await this.handlePromptAlias(conversation, binding, args, "/init");
+        return await this.handlePromptAlias(conversation, binding, args, "/init", ctx);
       case "cas_diff":
-        return await this.handlePromptAlias(conversation, binding, args, "/diff");
+        return await this.handlePromptAlias(conversation, binding, args, "/diff", ctx);
       case "cas_rename":
         return await this.handleRenameCommand(conversation, binding, args);
       default:
@@ -3430,23 +3452,69 @@ export class CodexPluginController {
     binding: StoredBinding | null,
     args: string,
     alias: string,
+    ctx?: PluginCommandContext,
   ): Promise<ReplyPayload> {
     if (!conversation) {
       return { text: "This command needs a Telegram or Discord conversation." };
     }
+    const parsed = this.parsePromptAliasArgs(args);
+    let targetBinding = binding;
+    if (parsed.cwd) {
+      const bindingApi = ctx ? asScopedBindingApi(ctx) : {};
+      const prompt = `${alias}${parsed.args.trim() ? ` ${parsed.args.trim()}` : ""}`;
+      const result = await this.startNewThreadAndBindConversation(
+        conversation,
+        binding,
+        parsed.cwd,
+        false,
+        {},
+        bindingApi.requestConversationBinding,
+        false,
+        prompt,
+      );
+      if (result.status === "pending") {
+        return result.reply;
+      }
+      if (result.status === "error") {
+        return { text: result.message };
+      }
+      targetBinding = result.binding;
+    }
     const workspaceDir = resolveWorkspaceDir({
-      bindingWorkspaceDir: binding?.workspaceDir,
+      bindingWorkspaceDir: targetBinding?.workspaceDir,
       configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
       serviceWorkspaceDir: this.serviceWorkspaceDir,
     });
     await this.startTurn({
       conversation,
-      binding,
+      binding: targetBinding,
       workspaceDir,
-      prompt: `${alias}${args.trim() ? ` ${args.trim()}` : ""}`,
+      prompt: `${alias}${parsed.args.trim() ? ` ${parsed.args.trim()}` : ""}`,
       reason: "command",
     });
     return { text: `Sent ${alias} to Codex.` };
+  }
+
+  private parsePromptAliasArgs(args: string): { cwd?: string; args: string } {
+    const tokens = normalizeOptionDashes(args)
+      .split(/\s+/)
+      .map((token) => token.trim())
+      .filter(Boolean);
+    const passthrough: string[] = [];
+    let cwd: string | undefined;
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      if (token === "--cwd") {
+        const next = tokens[index + 1]?.trim();
+        if (next) {
+          cwd = expandHomeDir(next);
+          index += 1;
+          continue;
+        }
+      }
+      passthrough.push(token);
+    }
+    return { cwd, args: passthrough.join(" ").trim() };
   }
 
   private async handleRenameCommand(
@@ -6249,8 +6317,10 @@ export class CodexPluginController {
     syncTopic: boolean,
     overrides: CommandPreferenceOverrides,
     requestConversationBinding?: PickerResponders["requestConversationBinding"],
+    notifyBound = true,
+    followUpPrompt?: string,
   ): Promise<
-    | { status: "bound" }
+    | { status: "bound"; binding: StoredBinding }
     | { status: "pending"; reply: ReplyPayload }
     | { status: "error"; message: string }
   > {
@@ -6278,7 +6348,8 @@ export class CodexPluginController {
         permissionsMode: profile,
         syncTopic,
         preferences,
-        notifyBound: true,
+        notifyBound,
+        followUpPrompt,
       },
       requestConversationBinding,
     );
@@ -6298,8 +6369,10 @@ export class CodexPluginController {
         await this.renameConversationIfSupported(conversation, syncedName);
       }
     }
-    await this.sendBoundConversationNotifications(conversation);
-    return { status: "bound" };
+    if (notifyBound) {
+      await this.sendBoundConversationNotifications(conversation);
+    }
+    return { status: "bound", binding: bindResult.binding };
   }
 
   private async resolveSingleThread(
@@ -6461,6 +6534,7 @@ export class CodexPluginController {
       threadTitle?: string;
       syncTopic?: boolean;
       notifyBound?: boolean;
+      followUpPrompt?: string;
       preferences?: ConversationPreferences;
     },
     requestBinding?: (
@@ -6505,6 +6579,7 @@ export class CodexPluginController {
           threadTitle: params.threadTitle,
           syncTopic: params.syncTopic,
           notifyBound: params.notifyBound,
+          followUpPrompt: params.followUpPrompt,
           preferences: params.preferences,
           updatedAt: Date.now(),
         });

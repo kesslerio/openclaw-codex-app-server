@@ -155,19 +155,27 @@ export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
   },
   cas_init: {
     summary: COMMAND_SUMMARY.cas_init,
-    usage: "/cas_init [args]",
-    flags: [{ flag: "[args]", description: "Arguments forwarded directly to Codex /init." }],
+    usage: "/cas_init [--cwd <path>] [args]",
+    flags: [
+      { flag: "--cwd <path>", description: "Start and bind a new Codex thread in this workspace before forwarding /init." },
+      { flag: "[args]", description: "Arguments forwarded to Codex /init." },
+    ],
     examples: [
       "/cas_init",
+      "/cas_init --cwd ~/projects/lobster-workflows",
       "/cas_init --help",
     ],
   },
   cas_diff: {
     summary: COMMAND_SUMMARY.cas_diff,
-    usage: "/cas_diff [args]",
-    flags: [{ flag: "[args]", description: "Arguments forwarded directly to Codex /diff." }],
+    usage: "/cas_diff [--cwd <path>] [args]",
+    flags: [
+      { flag: "--cwd <path>", description: "Start and bind a new Codex thread in this workspace before forwarding /diff." },
+      { flag: "[args]", description: "Arguments forwarded to Codex /diff." },
+    ],
     examples: [
       "/cas_diff",
+      "/cas_diff --cwd ~/projects/openclaw HEAD~1..HEAD",
       "/cas_diff HEAD~1..HEAD",
     ],
   },

@@ -1,7 +1,12 @@
-import { describe, expect, it } from "vitest";
-import { buildTelegramMenuWithPluginCommands } from "./telegram-menu.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildTelegramMenuWithPluginCommands, scheduleTelegramMenuRepair } from "./telegram-menu.js";
 
 describe("buildTelegramMenuWithPluginCommands", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
   it("prepends CAS commands and keeps existing menu commands after them", () => {
     const menu = buildTelegramMenuWithPluginCommands(
       [
@@ -34,5 +39,44 @@ describe("buildTelegramMenuWithPluginCommands", () => {
     expect(menu).toHaveLength(100);
     expect(menu[0]).toEqual({ command: "cas_resume", description: "Resume Codex" });
     expect(menu.at(-1)?.command).toBe("cmd_98");
+  });
+
+  it("cancels scheduled Telegram menu repair before the first API call", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const handle = scheduleTelegramMenuRepair({
+      commands: [["cas_resume", "Resume Codex"]],
+      env: { OPENCLAW_CHANNELS_TELEGRAM_BOT_TOKEN: "token" } as NodeJS.ProcessEnv,
+    });
+
+    handle?.cancel();
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not retry after a successful Telegram menu repair", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (url: string) => ({
+      ok: true,
+      json: async () =>
+        url.includes("getMyCommands")
+          ? { ok: true, result: [] }
+          : { ok: true, result: true },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    scheduleTelegramMenuRepair({
+      commands: [["cas_resume", "Resume Codex"]],
+      env: { OPENCLAW_CHANNELS_TELEGRAM_BOT_TOKEN: "token" } as NodeJS.ProcessEnv,
+    });
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

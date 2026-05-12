@@ -8,7 +8,7 @@ export declare class CodexPluginController {
     private readonly store;
     private serviceWorkspaceDir?;
     private lastRuntimeConfig?;
-    private telegramMenuRepairTimer?;
+    private telegramMenuRepairHandle?;
     private started;
     constructor(api: OpenClawPluginApi);
     createService(): OpenClawPluginService;
@@ -70,6 +70,7 @@ export declare class CodexPluginController {
     private handleModelCommand;
     private handlePermissionsCommand;
     private handlePromptAlias;
+    private parsePromptAliasArgs;
     private handleRenameCommand;
     private buildRenameStylePicker;
     private applyRenameStyle;

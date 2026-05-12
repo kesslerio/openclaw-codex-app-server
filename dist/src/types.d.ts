@@ -257,6 +257,7 @@ export type StoredPendingBind = {
     threadTitle?: string;
     syncTopic?: boolean;
     notifyBound?: boolean;
+    followUpPrompt?: string;
     preferences?: ConversationPreferences;
     updatedAt: number;
 };
