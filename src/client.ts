@@ -2291,6 +2291,57 @@ function mapPendingInputResponse(params: {
   return response;
 }
 
+function isFullAccessApprovalBypass(params: {
+  methodLower: string;
+  approvalPolicy?: string;
+  sandbox?: string;
+}): boolean {
+  return (
+    params.methodLower.includes("requestapproval") &&
+    params.approvalPolicy?.trim().toLowerCase() === "never" &&
+    normalizeSandboxMode(params.sandbox) === "danger-full-access"
+  );
+}
+
+function buildAutoApprovedPendingInputResponse(params: {
+  method: string;
+  methodLower: string;
+  requestParams: unknown;
+  options: string[];
+  approvalPolicy?: string;
+  sandbox?: string;
+}): unknown | undefined {
+  if (!isFullAccessApprovalBypass(params)) {
+    return undefined;
+  }
+  const state = createPendingInputState({
+    method: params.method,
+    requestParams: params.requestParams,
+    options: params.options,
+    requestId: "__auto_approved__",
+    expiresAt: Date.now(),
+  });
+  const actions = state.actions ?? [];
+  const acceptIndex = actions.findIndex(
+    (action) => action.kind === "approval" && action.decision === "accept",
+  );
+  const fallbackIndex = actions.findIndex(
+    (action) =>
+      action.kind === "approval" && action.decision !== "decline" && action.decision !== "cancel",
+  );
+  const selectedIndex = acceptIndex >= 0 ? acceptIndex : fallbackIndex;
+  if (selectedIndex < 0) {
+    return { decision: "accept" };
+  }
+  return mapPendingInputResponse({
+    methodLower: params.methodLower,
+    requestParams: params.requestParams,
+    response: { index: selectedIndex },
+    options: params.options,
+    actions,
+  });
+}
+
 function extractApprovalDecision(value: unknown): string | undefined {
   const record = asRecord(value);
   return record ? pickString(record, ["decision"]) : undefined;
@@ -2431,6 +2482,18 @@ function buildFullAccessPluginSettings(settings: PluginSettings): PluginSettings
       'sandbox_mode="danger-full-access"',
     ],
   };
+}
+
+function ignoreMissingThreadResume(
+  error: unknown,
+  logger: PluginLogger,
+  context: string,
+): undefined {
+  if (!isMissingThreadError(error)) {
+    throw error;
+  }
+  logger.warn(`${context}: ${String(error)}`);
+  return undefined;
 }
 
 export class CodexAppServerClient {
@@ -3111,6 +3174,20 @@ export class CodexAppServerClient {
       reviewThreadId ||= ids.threadId ?? "";
       turnId ||= ids.runId ?? "";
       const options = extractOptionValues(requestParams);
+      const autoApprovedResponse = buildAutoApprovedPendingInputResponse({
+        method,
+        methodLower,
+        requestParams,
+        options,
+        approvalPolicy: params.approvalPolicy,
+        sandbox: params.sandbox,
+      });
+      if (autoApprovedResponse) {
+        this.logger.debug(
+          `codex review auto-approved interactive request ${method} reviewThread=${reviewThreadId || "<none>"}`,
+        );
+        return autoApprovedResponse;
+      }
       const requestId = ids.requestId ?? `${params.runId}-${Date.now().toString(36)}`;
       const expiresAt = Date.now() + PENDING_INPUT_TTL_MS;
       const client = await getClient();
@@ -3426,10 +3503,24 @@ export class CodexAppServerClient {
       threadId ||= ids.threadId ?? "";
       turnId ||= ids.runId ?? "";
       const options = extractOptionValues(requestParams);
+      await fileEditNoticeBatcher.flush();
+      const autoApprovedResponse = buildAutoApprovedPendingInputResponse({
+        method,
+        methodLower,
+        requestParams,
+        options,
+        approvalPolicy: params.approvalPolicy,
+        sandbox: params.sandbox,
+      });
+      if (autoApprovedResponse) {
+        this.logger.debug(
+          `codex turn auto-approved interactive request ${method} run=${params.runId} thread=${threadId || "<none>"} turn=${turnId || "<none>"}`,
+        );
+        return autoApprovedResponse;
+      }
       const requestId = ids.requestId ?? `${params.runId}-${Date.now().toString(36)}`;
       const expiresAt = Date.now() + PENDING_INPUT_TTL_MS;
       const client = await getClient();
-      await fileEditNoticeBatcher.flush();
       const enrichedRequestParams =
         methodLower.includes("filechange/requestapproval") && ids.threadId && ids.itemId
           ? {
@@ -3536,11 +3627,17 @@ export class CodexAppServerClient {
                 sandbox: params.sandbox,
               }),
               timeoutMs: this.settings.requestTimeoutMs,
-            });
-            const resumedState = extractThreadState(resumed);
-            threadModel = resumedState.model?.trim() || threadModel;
+            }).catch((error) =>
+              ignoreMissingThreadResume(
+                error,
+                this.logger,
+                `codex turn created thread resume skipped before first rollout run=${params.runId} thread=${threadId}`,
+              ),
+            );
+            const resumedState = resumed ? extractThreadState(resumed) : undefined;
+            threadModel = resumedState?.model?.trim() || threadModel;
             threadReasoningEffort =
-              resumedState.reasoningEffort?.trim() || threadReasoningEffort;
+              resumedState?.reasoningEffort?.trim() || threadReasoningEffort;
           }
         } else {
           const resumed = await requestWithFallbacks({
@@ -3554,14 +3651,72 @@ export class CodexAppServerClient {
               sandbox: params.sandbox,
             }),
             timeoutMs: this.settings.requestTimeoutMs,
-          }).catch(() => undefined);
+          }).catch((error) => {
+            if (isMissingThreadError(error)) {
+              this.logger.warn(
+                `codex turn bound thread is unavailable; starting replacement thread run=${params.runId} staleThread=${threadId}`,
+              );
+              threadId = "";
+              return undefined;
+            }
+            return undefined;
+          });
           const resumedState = resumed ? extractThreadState(resumed) : undefined;
           threadModel = resumedState?.model?.trim() || threadModel;
           threadReasoningEffort =
             resumedState?.reasoningEffort?.trim() || threadReasoningEffort;
-          this.logger.debug(
-            `codex turn thread resumed run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
-          );
+          if (threadId) {
+            this.logger.debug(
+              `codex turn thread resumed run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
+            );
+          } else {
+            const created = await requestWithFallbacks({
+              client,
+              methods: ["thread/start", "thread/new"],
+              payloads: [
+                { cwd: params.workspaceDir, model: params.model },
+                { cwd: params.workspaceDir },
+                {},
+              ],
+              timeoutMs: this.settings.requestTimeoutMs,
+            });
+            const createdState = extractThreadState(created);
+            threadId = extractIds(created).threadId ?? "";
+            threadModel = createdState.model?.trim() || threadModel;
+            threadReasoningEffort =
+              createdState.reasoningEffort?.trim() || threadReasoningEffort;
+            if (!threadId) {
+              throw new Error("Codex App Server did not return a replacement thread id.");
+            }
+            this.logger.debug(
+              `codex turn replacement thread created run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
+            );
+            if (params.serviceTier || params.approvalPolicy || params.sandbox) {
+              const replacementResumed = await requestWithFallbacks({
+                client,
+                methods: ["thread/resume"],
+                payloads: buildThreadResumePayloads({
+                  threadId,
+                  serviceTier: params.serviceTier,
+                  approvalPolicy: params.approvalPolicy,
+                  sandbox: params.sandbox,
+                }),
+                timeoutMs: this.settings.requestTimeoutMs,
+              }).catch((error) =>
+                ignoreMissingThreadResume(
+                  error,
+                  this.logger,
+                  `codex turn replacement thread resume skipped before first rollout run=${params.runId} thread=${threadId}`,
+                ),
+              );
+              const replacementState = replacementResumed
+                ? extractThreadState(replacementResumed)
+                : undefined;
+              threadModel = replacementState?.model?.trim() || threadModel;
+              threadReasoningEffort =
+                replacementState?.reasoningEffort?.trim() || threadReasoningEffort;
+            }
+          }
         }
         const synthesizedDefaultMode = buildDefaultCollaborationMode({
           model: params.model?.trim() || threadModel,
@@ -3588,12 +3743,87 @@ export class CodexAppServerClient {
             `codex turn start omitted collaboration mode payload run=${params.runId} thread=${threadId} requestedMode=${collaborationMode.mode} requestedModel=${params.model?.trim() || "<none>"} threadModel=${threadModel || "<none>"}`,
           );
         }
-        const started = await requestWithFallbacks({
-          client,
-          methods: ["turn/start"],
-          payloads: turnStartPayloads,
-          timeoutMs: this.settings.requestTimeoutMs,
-        });
+        let started: unknown;
+        try {
+          started = await requestWithFallbacks({
+            client,
+            methods: ["turn/start"],
+            payloads: turnStartPayloads,
+            timeoutMs: this.settings.requestTimeoutMs,
+          });
+        } catch (error) {
+          if (!isMissingThreadError(error)) {
+            throw error;
+          }
+          const staleThreadId = threadId;
+          this.logger.warn(
+            `codex turn start thread is unavailable; retrying on replacement thread run=${params.runId} staleThread=${staleThreadId}`,
+          );
+          const replacement = await requestWithFallbacks({
+            client,
+            methods: ["thread/start", "thread/new"],
+            payloads: [
+              { cwd: params.workspaceDir, model: params.model },
+              { cwd: params.workspaceDir },
+              {},
+            ],
+            timeoutMs: this.settings.requestTimeoutMs,
+          });
+          const replacementState = extractThreadState(replacement);
+          threadId = extractIds(replacement).threadId ?? "";
+          threadModel = replacementState.model?.trim() || threadModel;
+          threadReasoningEffort =
+            replacementState.reasoningEffort?.trim() || threadReasoningEffort;
+          if (!threadId) {
+            throw new Error("Codex App Server did not return a replacement thread id.");
+          }
+          if (params.serviceTier || params.approvalPolicy || params.sandbox) {
+            const replacementResumed = await requestWithFallbacks({
+              client,
+              methods: ["thread/resume"],
+              payloads: buildThreadResumePayloads({
+                threadId,
+                serviceTier: params.serviceTier,
+                approvalPolicy: params.approvalPolicy,
+                sandbox: params.sandbox,
+              }),
+              timeoutMs: this.settings.requestTimeoutMs,
+            }).catch((error) =>
+              ignoreMissingThreadResume(
+                error,
+                this.logger,
+                `codex turn retry replacement thread resume skipped before first rollout run=${params.runId} thread=${threadId}`,
+              ),
+            );
+            const replacementResumeState = replacementResumed
+              ? extractThreadState(replacementResumed)
+              : undefined;
+            threadModel = replacementResumeState?.model?.trim() || threadModel;
+            threadReasoningEffort =
+              replacementResumeState?.reasoningEffort?.trim() || threadReasoningEffort;
+          }
+          const retryCollaborationMode =
+            params.collaborationMode ??
+            buildDefaultCollaborationMode({
+              model: params.model?.trim() || threadModel,
+              reasoningEffort: params.reasoningEffort?.trim() || threadReasoningEffort,
+            });
+          const retryPayloads = buildTurnStartPayloads({
+            threadId,
+            prompt: params.prompt,
+            input: params.input,
+            model: params.model,
+            serviceTier: params.serviceTier,
+            collaborationMode: retryCollaborationMode,
+            collaborationFallbackModel: params.model?.trim() || threadModel,
+          });
+          started = await requestWithFallbacks({
+            client,
+            methods: ["turn/start"],
+            payloads: retryPayloads,
+            timeoutMs: this.settings.requestTimeoutMs,
+          });
+        }
         const startedIds = extractIds(started);
         threadId ||= startedIds.threadId ?? "";
         turnId ||= startedIds.runId ?? "";
@@ -3896,6 +4126,7 @@ export class CodexAppServerModeClient {
 }
 
 export const __testing = {
+  buildAutoApprovedPendingInputResponse,
   buildThreadResumePayloads,
   buildTurnStartPayloads,
   buildTurnSteerPayloads,
@@ -3910,5 +4141,6 @@ export const __testing = {
   extractThreadTokenUsageSnapshot,
   extractRateLimitSummaries,
   formatStdioProcessLog,
+  isFullAccessApprovalBypass,
   resolveTurnStoppedReason,
 };

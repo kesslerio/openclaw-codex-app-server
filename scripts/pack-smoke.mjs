@@ -45,13 +45,15 @@ try {
     "package.json",
     "README.md",
     "LICENSE",
-    "index.ts",
+    path.join("dist", "index.js"),
     "openclaw.plugin.json",
-    path.join("src", "client.ts"),
+    path.join("dist", "src", "client.js"),
   ];
   const unexpectedFiles = [
     "AGENTS.md",
     "OVERNIGHT-TODO.md",
+    "index.ts",
+    path.join("src", "client.ts"),
     path.join("src", "client.test.ts"),
     path.join("src", "controller.test.ts"),
   ];
