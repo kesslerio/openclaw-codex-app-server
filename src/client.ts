@@ -2484,6 +2484,18 @@ function buildFullAccessPluginSettings(settings: PluginSettings): PluginSettings
   };
 }
 
+function ignoreMissingThreadResume(
+  error: unknown,
+  logger: PluginLogger,
+  context: string,
+): undefined {
+  if (!isMissingThreadError(error)) {
+    throw error;
+  }
+  logger.warn(`${context}: ${String(error)}`);
+  return undefined;
+}
+
 export class CodexAppServerClient {
   private connectionPromise:
     | Promise<{
@@ -3615,11 +3627,17 @@ export class CodexAppServerClient {
                 sandbox: params.sandbox,
               }),
               timeoutMs: this.settings.requestTimeoutMs,
-            });
-            const resumedState = extractThreadState(resumed);
-            threadModel = resumedState.model?.trim() || threadModel;
+            }).catch((error) =>
+              ignoreMissingThreadResume(
+                error,
+                this.logger,
+                `codex turn created thread resume skipped before first rollout run=${params.runId} thread=${threadId}`,
+              ),
+            );
+            const resumedState = resumed ? extractThreadState(resumed) : undefined;
+            threadModel = resumedState?.model?.trim() || threadModel;
             threadReasoningEffort =
-              resumedState.reasoningEffort?.trim() || threadReasoningEffort;
+              resumedState?.reasoningEffort?.trim() || threadReasoningEffort;
           }
         } else {
           const resumed = await requestWithFallbacks({
@@ -3633,14 +3651,72 @@ export class CodexAppServerClient {
               sandbox: params.sandbox,
             }),
             timeoutMs: this.settings.requestTimeoutMs,
-          }).catch(() => undefined);
+          }).catch((error) => {
+            if (isMissingThreadError(error)) {
+              this.logger.warn(
+                `codex turn bound thread is unavailable; starting replacement thread run=${params.runId} staleThread=${threadId}`,
+              );
+              threadId = "";
+              return undefined;
+            }
+            return undefined;
+          });
           const resumedState = resumed ? extractThreadState(resumed) : undefined;
           threadModel = resumedState?.model?.trim() || threadModel;
           threadReasoningEffort =
             resumedState?.reasoningEffort?.trim() || threadReasoningEffort;
-          this.logger.debug(
-            `codex turn thread resumed run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
-          );
+          if (threadId) {
+            this.logger.debug(
+              `codex turn thread resumed run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
+            );
+          } else {
+            const created = await requestWithFallbacks({
+              client,
+              methods: ["thread/start", "thread/new"],
+              payloads: [
+                { cwd: params.workspaceDir, model: params.model },
+                { cwd: params.workspaceDir },
+                {},
+              ],
+              timeoutMs: this.settings.requestTimeoutMs,
+            });
+            const createdState = extractThreadState(created);
+            threadId = extractIds(created).threadId ?? "";
+            threadModel = createdState.model?.trim() || threadModel;
+            threadReasoningEffort =
+              createdState.reasoningEffort?.trim() || threadReasoningEffort;
+            if (!threadId) {
+              throw new Error("Codex App Server did not return a replacement thread id.");
+            }
+            this.logger.debug(
+              `codex turn replacement thread created run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
+            );
+            if (params.serviceTier || params.approvalPolicy || params.sandbox) {
+              const replacementResumed = await requestWithFallbacks({
+                client,
+                methods: ["thread/resume"],
+                payloads: buildThreadResumePayloads({
+                  threadId,
+                  serviceTier: params.serviceTier,
+                  approvalPolicy: params.approvalPolicy,
+                  sandbox: params.sandbox,
+                }),
+                timeoutMs: this.settings.requestTimeoutMs,
+              }).catch((error) =>
+                ignoreMissingThreadResume(
+                  error,
+                  this.logger,
+                  `codex turn replacement thread resume skipped before first rollout run=${params.runId} thread=${threadId}`,
+                ),
+              );
+              const replacementState = replacementResumed
+                ? extractThreadState(replacementResumed)
+                : undefined;
+              threadModel = replacementState?.model?.trim() || threadModel;
+              threadReasoningEffort =
+                replacementState?.reasoningEffort?.trim() || threadReasoningEffort;
+            }
+          }
         }
         const synthesizedDefaultMode = buildDefaultCollaborationMode({
           model: params.model?.trim() || threadModel,
@@ -3667,12 +3743,87 @@ export class CodexAppServerClient {
             `codex turn start omitted collaboration mode payload run=${params.runId} thread=${threadId} requestedMode=${collaborationMode.mode} requestedModel=${params.model?.trim() || "<none>"} threadModel=${threadModel || "<none>"}`,
           );
         }
-        const started = await requestWithFallbacks({
-          client,
-          methods: ["turn/start"],
-          payloads: turnStartPayloads,
-          timeoutMs: this.settings.requestTimeoutMs,
-        });
+        let started: unknown;
+        try {
+          started = await requestWithFallbacks({
+            client,
+            methods: ["turn/start"],
+            payloads: turnStartPayloads,
+            timeoutMs: this.settings.requestTimeoutMs,
+          });
+        } catch (error) {
+          if (!isMissingThreadError(error)) {
+            throw error;
+          }
+          const staleThreadId = threadId;
+          this.logger.warn(
+            `codex turn start thread is unavailable; retrying on replacement thread run=${params.runId} staleThread=${staleThreadId}`,
+          );
+          const replacement = await requestWithFallbacks({
+            client,
+            methods: ["thread/start", "thread/new"],
+            payloads: [
+              { cwd: params.workspaceDir, model: params.model },
+              { cwd: params.workspaceDir },
+              {},
+            ],
+            timeoutMs: this.settings.requestTimeoutMs,
+          });
+          const replacementState = extractThreadState(replacement);
+          threadId = extractIds(replacement).threadId ?? "";
+          threadModel = replacementState.model?.trim() || threadModel;
+          threadReasoningEffort =
+            replacementState.reasoningEffort?.trim() || threadReasoningEffort;
+          if (!threadId) {
+            throw new Error("Codex App Server did not return a replacement thread id.");
+          }
+          if (params.serviceTier || params.approvalPolicy || params.sandbox) {
+            const replacementResumed = await requestWithFallbacks({
+              client,
+              methods: ["thread/resume"],
+              payloads: buildThreadResumePayloads({
+                threadId,
+                serviceTier: params.serviceTier,
+                approvalPolicy: params.approvalPolicy,
+                sandbox: params.sandbox,
+              }),
+              timeoutMs: this.settings.requestTimeoutMs,
+            }).catch((error) =>
+              ignoreMissingThreadResume(
+                error,
+                this.logger,
+                `codex turn retry replacement thread resume skipped before first rollout run=${params.runId} thread=${threadId}`,
+              ),
+            );
+            const replacementResumeState = replacementResumed
+              ? extractThreadState(replacementResumed)
+              : undefined;
+            threadModel = replacementResumeState?.model?.trim() || threadModel;
+            threadReasoningEffort =
+              replacementResumeState?.reasoningEffort?.trim() || threadReasoningEffort;
+          }
+          const retryCollaborationMode =
+            params.collaborationMode ??
+            buildDefaultCollaborationMode({
+              model: params.model?.trim() || threadModel,
+              reasoningEffort: params.reasoningEffort?.trim() || threadReasoningEffort,
+            });
+          const retryPayloads = buildTurnStartPayloads({
+            threadId,
+            prompt: params.prompt,
+            input: params.input,
+            model: params.model,
+            serviceTier: params.serviceTier,
+            collaborationMode: retryCollaborationMode,
+            collaborationFallbackModel: params.model?.trim() || threadModel,
+          });
+          started = await requestWithFallbacks({
+            client,
+            methods: ["turn/start"],
+            payloads: retryPayloads,
+            timeoutMs: this.settings.requestTimeoutMs,
+          });
+        }
         const startedIds = extractIds(started);
         threadId ||= startedIds.threadId ?? "";
         turnId ||= startedIds.runId ?? "";

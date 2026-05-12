@@ -497,6 +497,177 @@ describe("CodexAppServerClient.startReview", () => {
 });
 
 describe("CodexAppServerClient.startTurn", () => {
+  it("starts a replacement thread when a stored binding points at a missing app-server thread", async () => {
+    const request = vi.fn(async (method: string, payload: Record<string, unknown>) => {
+      if (method === "thread/resume" && payload.threadId === "stale-thread") {
+        throw new Error("codex app server rpc error (-32600): thread not found: stale-thread");
+      }
+      if (method === "thread/start") {
+        return {
+          threadId: "replacement-thread",
+          cwd: "/repo/openclaw",
+          model: "gpt-5.4",
+        };
+      }
+      if (method === "thread/resume" && payload.threadId === "replacement-thread") {
+        return {
+          threadId: "replacement-thread",
+          cwd: "/repo/openclaw",
+          model: "gpt-5.4",
+          approvalPolicy: "never",
+          sandbox: "danger-full-access",
+        };
+      }
+      if (method === "turn/start") {
+        return {
+          threadId: "replacement-thread",
+          runId: "turn-123",
+        };
+      }
+      return {};
+    });
+    const client = new CodexAppServerClient(
+      {
+        enabled: true,
+        transport: "stdio",
+        command: "codex",
+        args: [],
+        requestTimeoutMs: 1_000,
+      },
+      {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    );
+    (client as any).ensureConnected = vi.fn(async () => ({
+      client: {
+        connect: vi.fn(),
+        close: vi.fn(),
+        notify: vi.fn(),
+        request,
+        setNotificationHandler: vi.fn(),
+        setRequestHandler: vi.fn(),
+      },
+      initializeResult: {},
+    }));
+
+    const active = client.startTurn({
+      sessionKey: "session-123",
+      existingThreadId: "stale-thread",
+      prompt: "continue",
+      workspaceDir: "/repo/openclaw",
+      runId: "turn-1",
+      model: "gpt-5.4",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    });
+
+    await vi.waitFor(() => {
+      expect(request).toHaveBeenCalledWith(
+        "turn/start",
+        expect.objectContaining({
+          threadId: "replacement-thread",
+        }),
+        1_000,
+      );
+    });
+    expect(active.getThreadId()).toBe("replacement-thread");
+    await active.interrupt();
+    await active.result;
+  });
+
+  it("retries turn start on a replacement thread when the app-server loses the resumed thread", async () => {
+    const request = vi.fn(async (method: string, payload: Record<string, unknown>) => {
+      if (method === "thread/resume" && payload.threadId === "stale-thread") {
+        return {
+          threadId: "stale-thread",
+          cwd: "/repo/openclaw",
+          model: "gpt-5.4",
+          approvalPolicy: "never",
+          sandbox: "danger-full-access",
+        };
+      }
+      if (method === "thread/start") {
+        return {
+          threadId: "replacement-thread",
+          cwd: "/repo/openclaw",
+          model: "gpt-5.4",
+        };
+      }
+      if (method === "thread/resume" && payload.threadId === "replacement-thread") {
+        return {
+          threadId: "replacement-thread",
+          cwd: "/repo/openclaw",
+          model: "gpt-5.4",
+          approvalPolicy: "never",
+          sandbox: "danger-full-access",
+        };
+      }
+      if (method === "turn/start" && payload.threadId === "stale-thread") {
+        throw new Error("codex app server rpc error (-32600): thread not found: stale-thread");
+      }
+      if (method === "turn/start") {
+        return {
+          threadId: "replacement-thread",
+          runId: "turn-123",
+        };
+      }
+      return {};
+    });
+    const client = new CodexAppServerClient(
+      {
+        enabled: true,
+        transport: "stdio",
+        command: "codex",
+        args: [],
+        requestTimeoutMs: 1_000,
+      },
+      {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    );
+    (client as any).ensureConnected = vi.fn(async () => ({
+      client: {
+        connect: vi.fn(),
+        close: vi.fn(),
+        notify: vi.fn(),
+        request,
+        setNotificationHandler: vi.fn(),
+        setRequestHandler: vi.fn(),
+      },
+      initializeResult: {},
+    }));
+
+    const active = client.startTurn({
+      sessionKey: "session-123",
+      existingThreadId: "stale-thread",
+      prompt: "continue",
+      workspaceDir: "/repo/openclaw",
+      runId: "turn-1",
+      model: "gpt-5.4",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    });
+
+    await vi.waitFor(() => {
+      expect(request).toHaveBeenCalledWith(
+        "turn/start",
+        expect.objectContaining({
+          threadId: "replacement-thread",
+        }),
+        1_000,
+      );
+    });
+    expect(active.getThreadId()).toBe("replacement-thread");
+    await active.interrupt();
+    await active.result;
+  });
+
   it("keeps default-mode approvals interactive", async () => {
     const request = vi.fn(async (method: string) => {
       if (method === "thread/start") {

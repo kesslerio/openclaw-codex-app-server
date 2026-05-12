@@ -16,6 +16,7 @@ import type {
   ReplyPayload,
   ConversationRef,
 } from "openclaw/plugin-sdk";
+import { COMMANDS } from "./commands.js";
 import { resolvePluginSettings, resolveWorkspaceDir } from "./config.js";
 import { CodexAppServerModeClient, type ActiveCodexRun, isMissingThreadError } from "./client.js";
 import { getThreadDisplayTitle } from "./thread-display.js";
@@ -100,6 +101,7 @@ import {
   resolveOpenClawEntrypointPath,
   resolveCompatFallbackPath,
 } from "./openclaw-sdk-compat.js";
+import { scheduleTelegramMenuRepair } from "./telegram-menu.js";
 
 type DiscordSdkModule = typeof import("openclaw/plugin-sdk/discord");
 type TelegramAccountSdkModule = typeof import("openclaw/plugin-sdk/telegram-account");
@@ -1387,6 +1389,7 @@ export class CodexPluginController {
   private readonly store;
   private serviceWorkspaceDir?: string;
   private lastRuntimeConfig?: unknown;
+  private telegramMenuRepairTimer?: NodeJS.Timeout;
   private started = false;
 
   constructor(private readonly api: OpenClawPluginApi) {
@@ -1414,6 +1417,10 @@ export class CodexPluginController {
     }
     await this.store.load();
     await this.client.logStartupProbe().catch(() => undefined);
+    this.telegramMenuRepairTimer = scheduleTelegramMenuRepair({
+      commands: COMMANDS,
+      logger: this.api.logger,
+    });
     this.started = true;
   }
 
@@ -1423,6 +1430,10 @@ export class CodexPluginController {
     }
     for (const active of this.activeRuns.values()) {
       await active.handle.interrupt().catch(() => undefined);
+    }
+    if (this.telegramMenuRepairTimer) {
+      clearTimeout(this.telegramMenuRepairTimer);
+      this.telegramMenuRepairTimer = undefined;
     }
     this.activeRuns.clear();
     await this.client.close().catch(() => undefined);
